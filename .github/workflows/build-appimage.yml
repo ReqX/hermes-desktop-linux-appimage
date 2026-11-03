@@ -1,0 +1,226 @@
+name: Publish Hermes Desktop AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "Official NousResearch/hermes-agent release tag (blank = latest stable)"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-hermes-desktop
+  cancel-in-progress: false
+
+jobs:
+  publish-linux-appimage:
+    name: Build & Publish Linux x86-64 AppImage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve latest Hermes release
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ inputs.hermes_ref }}
+        run: |
+          set -euo pipefail
+          requested="${REQUESTED_REF//[[:space:]]/}"
+          if [[ -n "$requested" ]]; then
+            hermes_ref="$requested"
+          else
+            hermes_ref="$(
+              curl --fail --silent --show-error --location --retry 3 \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/NousResearch/hermes-agent/releases/latest \
+                | jq -er '.tag_name'
+            )"
+          fi
+
+          if [[ ! "$hermes_ref" =~ ^v[0-9] ]]; then
+            printf 'Ref does not match a valid release tag: %s\n' "$hermes_ref" >&2
+            exit 1
+          fi
+
+          release_tag="desktop-$hermes_ref"
+          release_exists=false
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+
+          printf 'Hermes upstream release: %s\n' "$hermes_ref"
+          printf 'Downstream release tag: %s\n' "$release_tag"
+          printf 'Already published: %s\n' "$release_exists"
+          printf 'hermes_ref=%s\n' "$hermes_ref" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'release_exists=%s\n' "$release_exists" >> "$GITHUB_OUTPUT"
+
+      - name: Check out official Hermes source
+        if: steps.source.outputs.release_exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ steps.source.outputs.hermes_ref }}
+          path: hermes-agent
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record resolved commit SHA
+        if: steps.source.outputs.release_exists != 'true'
+        id: hermes_source
+        working-directory: hermes-agent
+        env:
+          REQUESTED_REF: ${{ steps.source.outputs.hermes_ref }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          printf 'Requested ref: %s\n' "$REQUESTED_REF"
+          printf 'Resolved commit: %s\n' "$commit"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.source.outputs.release_exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: hermes-agent/package-lock.json
+
+      - name: Install dependencies
+        if: steps.source.outputs.release_exists != 'true'
+        working-directory: hermes-agent
+        run: |
+          npm ci --workspace apps/desktop --include-workspace-root --engine-strict=false
+
+      - name: Apply dependency hotfix for legacy tag if needed
+        if: steps.source.outputs.release_exists != 'true' && steps.source.outputs.hermes_ref == 'v2026.9.24'
+        working-directory: hermes-agent
+        run: |
+          npm install --no-save --package-lock=false --ignore-scripts --workspaces=false lucide-react@0.577.0
+
+      - name: Build Hermes Desktop app
+        if: steps.source.outputs.release_exists != 'true'
+        working-directory: hermes-agent
+        env:
+          HERMES_SOURCE_SHA: ${{ steps.hermes_source.outputs.commit }}
+          HERMES_SOURCE_REF: ${{ steps.source.outputs.hermes_ref }}
+        run: |
+          GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
+            npm run build --workspace apps/desktop
+
+      - name: Package Linux x86-64 AppImage
+        if: steps.source.outputs.release_exists != 'true'
+        working-directory: hermes-agent
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          mkdir -p apps/desktop/build
+          echo '{"type": "commonjs"}' > apps/desktop/build/package.json
+          npm run builder --workspace apps/desktop -- --linux AppImage --x64
+
+      - name: Verify embedded install stamp
+        if: steps.source.outputs.release_exists != 'true'
+        id: package
+        working-directory: hermes-agent
+        env:
+          EXPECTED_HERMES_SHA: ${{ steps.hermes_source.outputs.commit }}
+          EXPECTED_HERMES_REF: ${{ steps.source.outputs.hermes_ref }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t candidates < <(
+            find apps/desktop/release -maxdepth 1 -type f -name '*.AppImage' ! -name '*-arm64*' | sort
+          )
+
+          if [[ "${#candidates[@]}" -ne 1 ]]; then
+            printf 'Expected exactly 1 x86-64 AppImage artifact, found %d:\n' "${#candidates[@]}" >&2
+            printf ' - %s\n' "${candidates[@]}" >&2
+            exit 1
+          fi
+
+          appimage="${candidates[0]}"
+          dist_dir="$(dirname "$appimage")"
+          staged="$dist_dir/Hermes-Desktop-x86_64.AppImage"
+          mv "$appimage" "$staged"
+          chmod +x "$staged"
+          staged_abs="$(readlink -f "$staged")"
+
+          mkdir -p "$dist_dir/stamp-check"
+          (cd "$dist_dir/stamp-check" && "$staged_abs" --appimage-extract resources/install-stamp.json >/dev/null)
+
+          stamp_file="$dist_dir/stamp-check/squashfs-root/resources/install-stamp.json"
+
+          if [[ ! -f "$stamp_file" ]]; then
+            printf 'install-stamp.json not found in package\n' >&2
+            exit 1
+          fi
+
+          actual_commit="$(jq -er '.commit' "$stamp_file")"
+          if [[ "$actual_commit" != "$EXPECTED_HERMES_SHA" ]]; then
+            printf 'Stamp commit %s does not match expected %s\n' "$actual_commit" "$EXPECTED_HERMES_SHA" >&2
+            exit 1
+          fi
+
+          actual_branch="$(jq -er '.branch' "$stamp_file")"
+          if [[ "$actual_branch" != "$EXPECTED_HERMES_REF" ]]; then
+            printf 'Stamp branch %s does not match expected %s\n' "$actual_branch" "$EXPECTED_HERMES_REF" >&2
+            exit 1
+          fi
+
+          sha256="$(sha256sum "$staged" | awk '{print $1}')"
+          printf '%s  Hermes-Desktop-x86_64.AppImage\n' "$sha256" > "$dist_dir/Hermes-Desktop-x86_64.AppImage.sha256"
+
+          jq -n \
+            --arg commit "$actual_commit" \
+            --arg ref "$actual_branch" \
+            --arg sha256 "$sha256" \
+            --arg built_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{schemaVersion: 1, commit: $commit, branch: $ref, sha256: $sha256, builtAt: $built_at, source: "ci"}' \
+            > "$dist_dir/Hermes-Desktop-build-provenance.json"
+
+          printf 'appimage_path=%s\n' "$staged" >> "$GITHUB_OUTPUT"
+          dist_dir_abs="$(readlink -f "$dist_dir")"
+          printf 'dist_dir=%s\n' "$dist_dir_abs" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: steps.source.outputs.release_exists != 'true'
+        working-directory: hermes-agent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HERMES_REF: ${{ steps.source.outputs.hermes_ref }}
+          HERMES_SHA: ${{ steps.hermes_source.outputs.commit }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          DIST_DIR: ${{ steps.package.outputs.dist_dir }}
+        run: |
+          set -euo pipefail
+
+          notes="$(cat <<EOF
+          ## Hermes Desktop Linux AppImage — \`${HERMES_REF}\`
+
+          Automated downstream Linux x86-64 AppImage build of Nous Research Hermes Desktop.
+
+          - **Upstream Tag:** [\`${HERMES_REF}\`](https://github.com/NousResearch/hermes-agent/releases/tag/${HERMES_REF})
+          - **Upstream Commit:** \`${HERMES_SHA}\`
+          - **Build Runner:** GitHub Actions (\`ubuntu-24.04\`)
+
+          Verified embedded install stamp against upstream Git commit before publishing.
+          EOF
+          )"
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Hermes Desktop AppImage — ${HERMES_REF}" \
+            --notes "$notes" \
+            "$DIST_DIR/Hermes-Desktop-x86_64.AppImage" \
+            "$DIST_DIR/Hermes-Desktop-x86_64.AppImage.sha256" \
+            "$DIST_DIR/Hermes-Desktop-build-provenance.json"
