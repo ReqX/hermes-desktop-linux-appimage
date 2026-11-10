@@ -100,7 +100,9 @@ jobs:
           if [[ -f pnpm-lock.yaml ]]; then
             pnpm_ver="$(node -e "try{console.log(require('./pm/lock.json').packages.pnpm.version)}catch(e){console.log('12.15.0')}")"
             npm install -g "pnpm@$pnpm_ver"
-            pnpm install --frozen-lockfile --filter "{./apps/desktop}..."
+            # Hoisted (flat) node_modules: electron-builder's module walker OOMs on
+            # pnpm's default symlinked store layout.
+            pnpm install --frozen-lockfile --node-linker=hoisted --filter "{./apps/desktop}..."
           else
             npm ci --workspace apps/desktop --include-workspace-root --engine-strict=false
           fi
