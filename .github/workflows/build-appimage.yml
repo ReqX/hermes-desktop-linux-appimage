@@ -92,14 +92,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "26"
-          cache: npm
-          cache-dependency-path: hermes-agent/package-lock.json
 
       - name: Install dependencies
         if: steps.source.outputs.release_exists != 'true'
         working-directory: hermes-agent
         run: |
-          npm ci --workspace apps/desktop --include-workspace-root --engine-strict=false
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm_ver="$(node -e "try{console.log(require('./pm/lock.json').packages.pnpm.version)}catch(e){console.log('12.15.0')}")"
+            npm install -g "pnpm@$pnpm_ver"
+            pnpm install --frozen-lockfile --filter "{./apps/desktop}..."
+          else
+            npm ci --workspace apps/desktop --include-workspace-root --engine-strict=false
+          fi
 
       - name: Apply dependency hotfix for legacy tag if needed
         if: steps.source.outputs.release_exists != 'true' && steps.source.outputs.hermes_ref == 'v2026.9.24'
@@ -114,8 +118,13 @@ jobs:
           HERMES_SOURCE_SHA: ${{ steps.hermes_source.outputs.commit }}
           HERMES_SOURCE_REF: ${{ steps.source.outputs.hermes_ref }}
         run: |
-          GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
-            npm run build --workspace apps/desktop
+          if [[ -f pnpm-lock.yaml ]]; then
+            GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
+              pnpm --filter hermes run build
+          else
+            GITHUB_SHA="$HERMES_SOURCE_SHA" GITHUB_REF_NAME="$HERMES_SOURCE_REF" \
+              npm run build --workspace apps/desktop
+          fi
 
       - name: Package Linux x86-64 AppImage
         if: steps.source.outputs.release_exists != 'true'
@@ -127,7 +136,11 @@ jobs:
           semver="${HERMES_REF#v}"
           mkdir -p apps/desktop/build
           echo '{"type": "commonjs"}' > apps/desktop/build/package.json
-          npm run builder --workspace apps/desktop -- --linux AppImage --x64 -c.extraMetadata.version="$semver" 
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm --filter hermes run builder -- --linux AppImage --x64 -c.extraMetadata.version="$semver"
+          else
+            npm run builder --workspace apps/desktop -- --linux AppImage --x64 -c.extraMetadata.version="$semver"
+          fi 
 
       - name: Verify embedded install stamp
         if: steps.source.outputs.release_exists != 'true'
