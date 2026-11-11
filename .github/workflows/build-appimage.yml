@@ -8,8 +8,11 @@ on:
         required: false
         default: ""
         type: string
-  schedule:
-    - cron: "0 12 * * *"
+  # Schedule disabled 2026-11-11: upstream v0.23.x switched to pnpm and their
+  # pinned electron-builder alpha OOMs on the module walk (16GB runner heap).
+  # Re-enable when upstream fixes the walker or re-enables their own Linux legs.
+  # schedule:
+  #   - cron: "0 12 * * *"
 
 permissions:
   contents: write
