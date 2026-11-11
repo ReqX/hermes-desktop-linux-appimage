@@ -54,6 +54,26 @@ jobs:
             exit 1
           fi
 
+          # v0.23.0+ switched upstream to pnpm; their pinned electron-builder
+          # alpha OOMs the module walk on 16GB runners (both linker modes
+          # tested 2026-11-11). Skip those tags until upstream fixes it.
+          # npm-era (buildable): CalVer tags (v2026.*) and SemVer <= 0.22.x
+          skip_pnpm_era=false
+          if [[ ! "$hermes_ref" =~ ^v2026\. ]]; then
+            semver="${hermes_ref#v}"
+            if ! printf '%s\n' "$semver" "0.23.0" | sort -V -C; then
+              skip_pnpm_era=true
+            fi
+          fi
+
+          if [[ "$skip_pnpm_era" == "true" ]]; then
+            printf 'Skipping %s: pnpm-era release (>= v0.23.0) cannot be packaged until upstream fixes the electron-builder module walk.\n' "$hermes_ref"
+            printf 'hermes_ref=%s\n' "$hermes_ref" >> "$GITHUB_OUTPUT"
+            printf 'release_tag=desktop-%s\n' "$hermes_ref" >> "$GITHUB_OUTPUT"
+            printf 'release_exists=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           release_tag="desktop-$hermes_ref"
           release_exists=false
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
